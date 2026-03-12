@@ -1,7 +1,7 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
-#ifdef FLOAT16
+#if defined(FLOAT16) || defined(ARITH_F16)
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 
@@ -77,10 +77,17 @@ void main() {
 
             float kv_col = 0.0;
             [[unroll]] for (uint i = 0; i < S_V; i += 4) {
+#ifdef ARITH_F16
+                kv_col += float(dot(
+                    f16vec4(state[i], state[i+1], state[i+2], state[i+3]),
+                    f16vec4(s_k[i], s_k[i+1], s_k[i+2], s_k[i+3])
+                ));
+#else
                 kv_col += dot(
                     vec4(state[i], state[i+1], state[i+2], state[i+3]),
                     vec4(s_k[i], s_k[i+1], s_k[i+2], s_k[i+3])
                 );
+#endif
             }
 
             float delta_col = (v_val - g_val * kv_col) * beta_val;
@@ -93,17 +100,28 @@ void main() {
                 state[i] = FLOAT_TYPE(sv.x); state[i+1] = FLOAT_TYPE(sv.y);
                 state[i+2] = FLOAT_TYPE(sv.z); state[i+3] = FLOAT_TYPE(sv.w);
 
+#ifdef ARITH_F16
+                attn_col += float(dot(f16vec4(sv), f16vec4(s_q[i], s_q[i+1], s_q[i+2], s_q[i+3])));
+#else
                 attn_col += dot(sv, vec4(s_q[i], s_q[i+1], s_q[i+2], s_q[i+3]));
+#endif
             }
 
             data_dst[attn_off + col] = D_TYPE(attn_col * scale);
         } else {
             float kv_col = 0.0;
             [[unroll]] for (uint i = 0; i < S_V; i += 4) {
+#ifdef ARITH_F16
+                f16vec4 gv = f16vec4(s_g[i], s_g[i+1], s_g[i+2], s_g[i+3]);
+                f16vec4 sv = f16vec4(state[i], state[i+1], state[i+2], state[i+3]);
+                f16vec4 kv = f16vec4(s_k[i], s_k[i+1], s_k[i+2], s_k[i+3]);
+                kv_col += float(dot(gv * sv, kv));
+#else
                 vec4 gv = vec4(s_g[i], s_g[i+1], s_g[i+2], s_g[i+3]);
                 vec4 sv = vec4(state[i], state[i+1], state[i+2], state[i+3]);
                 vec4 kv = vec4(s_k[i], s_k[i+1], s_k[i+2], s_k[i+3]);
                 kv_col += dot(gv * sv, kv);
+#endif
             }
 
             float delta_col = (v_val - kv_col) * beta_val;
@@ -117,7 +135,11 @@ void main() {
                 state[i] = FLOAT_TYPE(sv.x); state[i+1] = FLOAT_TYPE(sv.y);
                 state[i+2] = FLOAT_TYPE(sv.z); state[i+3] = FLOAT_TYPE(sv.w);
 
+#ifdef ARITH_F16
+                attn_col += float(dot(f16vec4(sv), f16vec4(s_q[i], s_q[i+1], s_q[i+2], s_q[i+3])));
+#else
                 attn_col += dot(sv, vec4(s_q[i], s_q[i+1], s_q[i+2], s_q[i+3]));
+#endif
             }
 
             data_dst[attn_off + col] = D_TYPE(attn_col * scale);

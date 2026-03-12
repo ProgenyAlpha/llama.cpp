@@ -828,6 +828,8 @@ struct vk_device_struct {
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128
     vk_pipeline pipeline_gated_delta_net[3][2];
     vk_pipeline pipeline_gated_delta_net_f16[3][2];
+    vk_pipeline pipeline_gated_delta_net_f16_arith[3][2];
+    vk_pipeline pipeline_gated_delta_net_sharded[3][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -4595,6 +4597,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
             {"gated_delta_net_f16_d64",     "gated_delta_net_f16_d64_kda"},
             {"gated_delta_net_f16_d128",    "gated_delta_net_f16_d128_kda"},
         };
+        const char * gdn_names_f16_arith[][2] = {
+            {"gated_delta_net_f16a_d32",     "gated_delta_net_f16a_d32_kda"},
+            {"gated_delta_net_f16a_d64",     "gated_delta_net_f16a_d64_kda"},
+            {"gated_delta_net_f16a_d128",    "gated_delta_net_f16a_d128_kda"},
+        };
+        const char * gdn_names_sharded[][2] = {
+            {"gated_delta_net_sharded_d32",     "gated_delta_net_sharded_d32_kda"},
+            {"gated_delta_net_sharded_d64",     "gated_delta_net_sharded_d64_kda"},
+            {"gated_delta_net_sharded_d128",    "gated_delta_net_sharded_d128_kda"},
+        };
         for (uint32_t si = 0; si < 3; si++) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
@@ -4606,6 +4618,25 @@ static void ggml_vk_load_shaders(vk_device& device) {
                         gdn_names_f16[si][kda], gated_delta_net_f16_len, gated_delta_net_f16_data,
                         "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                         {1, 1, 1}, {gdn_sizes[si], kda}, 1);
+                    ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_f16_arith[si][kda],
+                        gdn_names_f16_arith[si][kda], gated_delta_net_f16_arith_len, gated_delta_net_f16_arith_data,
+                        "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                        {1, 1, 1}, {gdn_sizes[si], kda}, 1);
+                }
+                // Sharded variant: distributes state column across subgroup lanes.
+                // Requires S_V >= subgroup_size so each lane gets at least one element.
+                if (gdn_sizes[si] >= device->subgroup_size) {
+                    if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
+                        ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_sharded[si][kda],
+                            gdn_names_sharded[si][kda], gated_delta_net_sharded_subgroup_f32_len, gated_delta_net_sharded_subgroup_f32_data,
+                            "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                            {1, 1, 1}, {gdn_sizes[si], device->subgroup_size, kda}, 1, true, true);
+                    } else {
+                        ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_sharded[si][kda],
+                            gdn_names_sharded[si][kda], gated_delta_net_sharded_f32_len, gated_delta_net_sharded_f32_data,
+                            "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                            {1, 1, 1}, {gdn_sizes[si], device->subgroup_size, kda}, 1, true, true);
+                    }
                 }
             }
         }
@@ -9552,6 +9583,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 2; break;
                 default: return nullptr;
             }
+            // Sharded is preferred (lower register pressure), then f16, then f32.
+            // Pipeline selection and dispatch grid are coordinated in ggml_vk_gated_delta_net.
+            if (ctx->device->pipeline_gated_delta_net_sharded[si][kda]) {
+                return ctx->device->pipeline_gated_delta_net_sharded[si][kda];
+            }
             if (ctx->device->fp16 && ctx->device->pipeline_gated_delta_net_f16[si][kda]) {
                 return ctx->device->pipeline_gated_delta_net_f16[si][kda];
             }
@@ -10436,9 +10472,27 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         scale
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
-        pc, { H, n_seqs, 1u });
+    // Sharded kernel dispatches S_V/num_subgroups columns per workgroup in z
+    const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
+    uint32_t si;
+    switch (S_v) {
+        case 32:  si = 0; break;
+        case 64:  si = 1; break;
+        default:  si = 2; break;
+    }
+    const bool is_sharded = (pipeline == ctx->device->pipeline_gated_delta_net_sharded[si][kda]);
+
+    if (is_sharded) {
+        const uint32_t num_subgroups = S_v / ctx->device->subgroup_size;
+        const uint32_t num_wg_z = CEIL_DIV(S_v, num_subgroups);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+            pc, { H, n_seqs, num_wg_z });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+            pc, { H, n_seqs, 1u });
+    }
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {

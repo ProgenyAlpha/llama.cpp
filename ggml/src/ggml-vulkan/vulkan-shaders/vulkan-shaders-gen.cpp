@@ -989,6 +989,10 @@ void process_shaders() {
 
     string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}}));
     string_to_spv("gated_delta_net_f16", "gated_delta_net.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT16", "1"}}));
+    string_to_spv("gated_delta_net_f16_arith", "gated_delta_net.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ARITH_F16", "1"}}));
+
+    string_to_spv("gated_delta_net_sharded_f32",          "gated_delta_net_sharded.comp", {});
+    string_to_spv("gated_delta_net_sharded_subgroup_f32", "gated_delta_net_sharded.comp", {{"USE_SUBGROUP_ADD", "1"}});
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
