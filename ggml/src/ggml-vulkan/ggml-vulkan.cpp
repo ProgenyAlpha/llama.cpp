@@ -9585,6 +9585,23 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
             // Sharded is preferred (lower register pressure), then f16, then f32.
             // Pipeline selection and dispatch grid are coordinated in ggml_vk_gated_delta_net.
+            const char * gdn_var = getenv("GGML_VK_GDN_VARIANT");
+            int gdn_variant = gdn_var ? atoi(gdn_var) : -1;
+            // 0 = f32 baseline, 1 = f16 state, 2 = f16 arithmetic, 3 = sharded
+            // -1 = auto (sharded > f16 state > f32)
+            switch (gdn_variant) {
+                case 0: return ctx->device->pipeline_gated_delta_net[si][kda];
+                case 1: if (ctx->device->pipeline_gated_delta_net_f16[si][kda])
+                            return ctx->device->pipeline_gated_delta_net_f16[si][kda];
+                        break;
+                case 2: if (ctx->device->pipeline_gated_delta_net_f16_arith[si][kda])
+                            return ctx->device->pipeline_gated_delta_net_f16_arith[si][kda];
+                        break;
+                case 3: if (ctx->device->pipeline_gated_delta_net_sharded[si][kda])
+                            return ctx->device->pipeline_gated_delta_net_sharded[si][kda];
+                        break;
+                default: break;
+            }
             if (ctx->device->pipeline_gated_delta_net_sharded[si][kda]) {
                 return ctx->device->pipeline_gated_delta_net_sharded[si][kda];
             }
