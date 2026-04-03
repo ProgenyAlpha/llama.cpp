@@ -828,6 +828,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128
     vk_pipeline pipeline_gated_delta_net[3][2];
+    vk_pipeline pipeline_gated_delta_net_chunk_intra;
+    vk_pipeline pipeline_gated_delta_net_chunk_inter;
+    vk_pipeline pipeline_gated_delta_net_chunk_output;
+    vk_pipeline pipeline_gated_delta_net_chunk_output_cm;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1482,6 +1486,18 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
+};
+
+struct vk_op_gated_delta_net_chunk_push_constants {
+    uint32_t H;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t neq1, rq3;
+    uint32_t n_chunks;
+    uint32_t s_off;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -4652,6 +4668,24 @@ static void ggml_vk_load_shaders(vk_device& device) {
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
         }
+    }
+
+    ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_chunk_intra,
+        "gated_delta_net_chunk_intra_f32", gated_delta_net_chunk_intra_f32_len, gated_delta_net_chunk_intra_f32_data,
+        "main", 8, sizeof(vk_op_gated_delta_net_chunk_push_constants), {1, 1, 1}, {128, 64}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_chunk_inter,
+        "gated_delta_net_chunk_inter_f32", gated_delta_net_chunk_inter_f32_len, gated_delta_net_chunk_inter_f32_data,
+        "main", 9, sizeof(vk_op_gated_delta_net_chunk_push_constants), {1, 1, 1}, {128, 64}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_chunk_output,
+        "gated_delta_net_chunk_output_f32", gated_delta_net_chunk_output_f32_len, gated_delta_net_chunk_output_f32_data,
+        "main", 6, sizeof(vk_op_gated_delta_net_chunk_push_constants), {1, 1, 1}, {128, 64}, 1);
+
+    if (device->coopmat_support && device->coopmat_acc_f32_support) {
+        ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_chunk_output_cm,
+            "gated_delta_net_chunk_output_cm1_f32", gated_delta_net_chunk_output_cm1_f32_len, gated_delta_net_chunk_output_cm1_f32_data,
+            "main", 6, sizeof(vk_op_gated_delta_net_chunk_push_constants), {1, 1, 1}, {256, 64, 128}, 1);
     }
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
@@ -10426,6 +10460,9 @@ static void ggml_vk_rwkv_wkv7(ggml_backend_vk_context * ctx, vk_context& subctx,
     );
 }
 
+static constexpr uint32_t GDN_CHUNK_SIZE = 64;
+static constexpr uint32_t GDN_CHUNK_THRESHOLD = 64;
+
 static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
@@ -10440,17 +10477,6 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
 
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
 
-    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
-    GGML_ASSERT(pipeline != nullptr);
-
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    vk_subbuffer src_buf[6] = {};
-    for (int i = 0; i < 6; i++) {
-        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
-    }
-
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
     const uint32_t sq3 = (uint32_t)(src_q->nb[3] / sizeof(float));
@@ -10464,19 +10490,112 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t neq1 = (uint32_t)src_q->ne[1];
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
-    const float scale = 1.0f / sqrtf((float)S_v);
-    const vk_op_gated_delta_net_push_constants pc = {
-        H, n_tokens, n_seqs, s_off,
-        sq1, sq2, sq3,
-        sv1, sv2, sv3,
-        sb1, sb2, sb3,
-        neq1, rq3,
-        scale
-    };
+    const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
+    const bool use_chunked = !kda && S_v == 128 && n_tokens > GDN_CHUNK_THRESHOLD;
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
-        pc, { H, n_seqs, S_v });
+    if (use_chunked) {
+        const uint32_t n_chunks = (n_tokens + GDN_CHUNK_SIZE - 1) / GDN_CHUNK_SIZE;
+        const uint32_t state_size = S_v * S_v;
+
+        const uint64_t scratch_w    = (uint64_t)n_seqs * n_chunks * H * GDN_CHUNK_SIZE * S_v * sizeof(float);
+        const uint64_t scratch_u    = scratch_w;
+        const uint64_t scratch_vnew = scratch_w;
+        const uint64_t scratch_decay = (uint64_t)n_seqs * n_chunks * H * sizeof(float);
+        const uint64_t scratch_gcum  = (uint64_t)n_seqs * n_chunks * H * GDN_CHUNK_SIZE * sizeof(float);
+        const uint64_t scratch_h     = (uint64_t)n_seqs * n_chunks * H * state_size * sizeof(float);
+        const uint64_t scratch_total = scratch_w + scratch_u + scratch_vnew + scratch_decay + scratch_gcum + scratch_h;
+
+        if (scratch_total > ctx->device->properties.limits.maxStorageBufferRange) {
+            goto autoregressive_fallback;
+        }
+
+        if (ctx->prealloc_size_split_k < scratch_total) {
+            ctx->prealloc_size_split_k = scratch_total;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+
+        uint64_t scratch_offset = 0;
+        vk_subbuffer buf_w     = {ctx->prealloc_split_k, scratch_offset, scratch_w};     scratch_offset += scratch_w;
+        vk_subbuffer buf_u     = {ctx->prealloc_split_k, scratch_offset, scratch_u};     scratch_offset += scratch_u;
+        vk_subbuffer buf_vnew  = {ctx->prealloc_split_k, scratch_offset, scratch_vnew};  scratch_offset += scratch_vnew;
+        vk_subbuffer buf_decay = {ctx->prealloc_split_k, scratch_offset, scratch_decay}; scratch_offset += scratch_decay;
+        vk_subbuffer buf_gcum  = {ctx->prealloc_split_k, scratch_offset, scratch_gcum};  scratch_offset += scratch_gcum;
+        vk_subbuffer buf_h     = {ctx->prealloc_split_k, scratch_offset, scratch_h};
+
+        vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+        vk_subbuffer src_buf[6] = {};
+        for (int i = 0; i < 6; i++) {
+            src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+        }
+
+        const vk_op_gated_delta_net_chunk_push_constants pc = {
+            H, n_tokens, n_seqs,
+            sq1, sq2, sq3,
+            sv1, sv2, sv3,
+            sb1, sb2, sb3,
+            neq1, rq3,
+            n_chunks, s_off
+        };
+
+        vk_pipeline p_intra = ctx->device->pipeline_gated_delta_net_chunk_intra;
+        vk_pipeline p_inter = ctx->device->pipeline_gated_delta_net_chunk_inter;
+        vk_pipeline p_output = ctx->device->pipeline_gated_delta_net_chunk_output_cm;
+        if (!p_output) {
+            p_output = ctx->device->pipeline_gated_delta_net_chunk_output;
+        }
+
+        ggml_pipeline_request_descriptor_sets(ctx, p_intra, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, p_inter, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, p_output, 1);
+
+        ggml_vk_dispatch_pipeline(ctx, subctx, p_intra,
+            {src_buf[1], src_buf[2], src_buf[3], src_buf[4], buf_w, buf_u, buf_decay, buf_gcum},
+            pc, { n_chunks * H, n_seqs, 1 });
+
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        ggml_vk_dispatch_pipeline(ctx, subctx, p_inter,
+            {src_buf[1], buf_w, buf_u, buf_decay, buf_gcum, src_buf[5], buf_h, buf_vnew, dst_buf},
+            pc, { H, n_seqs, 1 });
+
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        ggml_vk_dispatch_pipeline(ctx, subctx, p_output,
+            {src_buf[0], src_buf[1], buf_h, buf_vnew, buf_gcum, dst_buf},
+            pc, { n_chunks * H, n_seqs, 1 });
+
+        ctx->prealloc_split_k_need_sync = true;
+
+        return;
+    }
+
+autoregressive_fallback:
+    {
+        vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
+        GGML_ASSERT(pipeline != nullptr);
+
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+        vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+        vk_subbuffer src_buf[6] = {};
+        for (int i = 0; i < 6; i++) {
+            src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+        }
+
+        const float scale = 1.0f / sqrtf((float)S_v);
+        const vk_op_gated_delta_net_push_constants pc = {
+            H, n_tokens, n_seqs, s_off,
+            sq1, sq2, sq3,
+            sv1, sv2, sv3,
+            sb1, sb2, sb3,
+            neq1, rq3,
+            scale
+        };
+
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+            pc, { H, n_seqs, S_v });
+    }
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
